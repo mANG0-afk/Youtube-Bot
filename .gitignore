@@ -1,0 +1,98 @@
+# =============================================================================
+# SECRETS — never commit these
+#
+# secrets.env holds your YouTube refresh token (a standing grant to your
+# account) and the Databricks service-principal secret. If either reaches a
+# public repo, revoke immediately — deleting the file later does NOT remove it
+# from git history.
+# =============================================================================
+secrets.env
+.env
+.env.*
+!.env.example
+
+# Google OAuth artefacts from the refresh-token script
+client_secret.json
+token.json
+*credentials.json
+
+# Databricks CLI profile
+.databrickscfg
+
+
+# =============================================================================
+# APP STATE
+#
+# app_state.db is the ONE database that is committed on purpose. It holds the
+# pre-seeded YouTube resolution cache (video ids + titles, no secrets), which
+# takes genre playlists from ~5/day to ~16/day because hosted filesystems are
+# wiped on every restart. The negation must come AFTER the *.db line.
+# =============================================================================
+*.db
+*.sqlite
+*.sqlite3
+!app_state.db
+
+# Conversation checkpoints — per-session, no reason to keep
+checkpoints.db
+checkpoints.db-*
+
+
+# =============================================================================
+# PYTHON
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+
+# =============================================================================
+# VIRTUAL ENVIRONMENTS
+# =============================================================================
+venv/
+.venv/
+env/
+ENV/
+.conda/
+
+
+# =============================================================================
+# NOTEBOOKS
+# Outputs can contain query results and, if you ever printed one, a secret.
+# =============================================================================
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+
+# =============================================================================
+# ML / LOGS
+# =============================================================================
+mlruns/
+mlartifacts/
+*.log
+logs/
+
+
+# =============================================================================
+# EDITOR / OS
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# =============================================================================
+# STREAMLIT
+# Local secrets.toml is Streamlit's own secret store — same risk as .env.
+# =============================================================================
+.streamlit/secrets.toml

@@ -1,0 +1,12 @@
+streamlit>=1.40
+langgraph>=0.6
+langgraph-checkpoint-sqlite>=2.0
+langchain>=0.3
+langchain-core>=0.3
+databricks-sql-connector>=3.7
+databricks-sdk>=0.40
+databricks-langchain
+google-api-python-client>=2.150
+google-auth>=2.35
+requests>=2.32
+python-dotenv>=1.0
