@@ -8,6 +8,7 @@ downstream. The LLM never carries the track list, so it cannot corrupt it.
 GENRES and MOODS load from gold.genre / gold.mood_tag at import.
 """
 
+import os
 from typing import Annotated, Optional, TypedDict
 
 from langchain_core.messages import SystemMessage
@@ -278,7 +279,7 @@ def resolve_to_youtube(candidate_set_id: str) -> dict:
 # account is mutated, so a human confirms. Needs a checkpointer.
 # --------------------------------------------------------------------------
 @tool(args_schema=CreateInput)
-def create_youtube_playlist(resolved_set_id: str, title: str,
+def create_youtube_playlist(resolved_set_id: str, title: str = "",
                             description: str = "") -> dict:
     """
     Create a new YouTube playlist from a resolved set. Spends quota and writes
@@ -429,8 +430,16 @@ def build_graph(checkpointer):
 
     specs = [sanitize(convert_to_openai_tool(t)) for t in TOOLS]
 
-    llm = ChatDatabricks(endpoint="databricks-llama-4-maverick",
-                         temperature=0).bind(tools=specs)
+    # llama-4-maverick and gpt-oss/qwen on Databricks stop emitting structured
+    # tool_calls once the history holds TWO tool round-trips -- they fall back to
+    # Llama's text syntax ("[create_youtube_playlist(resolved_set_id=rs_x)]") and
+    # even leak a raw "assistant" header. tools_condition then sees no tool_calls,
+    # routes to END, and the write tool never runs, so the approval interrupt
+    # never fires. llama-3-3-70b handles the multi-turn tool history correctly.
+    llm = ChatDatabricks(
+        endpoint=os.environ.get("LLM_ENDPOINT",
+                                "databricks-meta-llama-3-3-70b-instruct"),
+        temperature=0).bind(tools=specs)
 
     def agent(state: AgentState):
         return {"messages": [llm.invoke([SystemMessage(SYSTEM)] + state["messages"])]}
