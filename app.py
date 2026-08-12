@@ -112,6 +112,19 @@ p.tagline {{ color: #8C8C8C; font-size: .82rem; margin: 0 0 1.6rem 0; }}
     text-transform: uppercase; margin: 1.1rem 0 .55rem 0;
 }}
 
+/* Top-left warm-up indicator */
+.warm {{
+    display: flex; align-items: center; gap: .5rem; color: #8C8C8C;
+    font-size: .7rem; letter-spacing: .08em; text-transform: uppercase;
+    margin-bottom: 1rem;
+}}
+.spin {{
+    width: .78rem; height: .78rem; border: 2px solid #3A3000;
+    border-top-color: var(--yellow); border-radius: 50%;
+    display: inline-block; animation: spin .7s linear infinite;
+}}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
 /* Landing: owner key, then a visitor path */
 p.orbar {{
     display: flex; align-items: center; gap: .8rem;
@@ -150,6 +163,59 @@ p.orbar::before, p.orbar::after {{
 # Playlist CREATION uses the owner's OAuth token against the owner's channel, so
 # it unlocks only for whoever holds OWNER_KEY. Unset OWNER_KEY and writes are
 # simply on, which is what a local run wants.
+# ---------------------------------------------------------------------------
+# Warm-up
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def warmup() -> dict:
+    """
+    Connect to the warehouse in the background as soon as the URL is hit.
+
+    Cold start is ~41s: importing backend pulls the Databricks SQL/SDK stack
+    (14s) and importing tools runs load_genres()/load_moods() against the
+    warehouse (21s). That cost used to land on the click that picks a mode, and
+    Streamlit keeps the PREVIOUS frame on screen while a slow rerun finishes --
+    so the landing screen, button included, sat there looking like the click had
+    done nothing. Starting the work when the page first loads overlaps it with
+    the user reading the page.
+
+    Once per container via cache_resource. The thread calls no st.* API, so it
+    needs no script context, and the returned dict is shared state the script
+    polls. Import locking means a mode picked mid-warm simply waits on the same
+    work rather than duplicating it.
+    """
+    import threading
+
+    status = {"ready": False, "error": None}
+
+    def connect():
+        try:
+            import backend as be
+            import tools            # noqa: F401 -- import IS the work
+            be.init_app_state()
+            status["ready"] = True
+        except Exception as e:
+            status["error"] = f"{type(e).__name__}: {e}"
+
+    threading.Thread(target=connect, daemon=True).start()
+    return status
+
+
+WARM = warmup()
+
+
+@st.fragment(run_every=1.5)
+def warm_badge() -> None:
+    """
+    Self-refreshing so it clears itself without waiting for the user to click.
+    A plain element would sit there stale until the next natural rerun.
+    """
+    if WARM["ready"] or WARM["error"]:
+        return
+    st.markdown('<div class="warm"><span class="spin"></span>starting up</div>',
+                unsafe_allow_html=True)
+
+
 OWNER_KEY = os.environ.get("OWNER_KEY", "")
 
 
@@ -344,6 +410,8 @@ def trace_turn(kind: str):
         span.set_attribute("playlists_made", st.session_state.playlists_made)
         yield
 
+
+warm_badge()
 
 if mode() is None:
     choose_mode()
