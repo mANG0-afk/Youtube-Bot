@@ -6,6 +6,7 @@ Locally: put the nine vars in secrets.env next to this file.
 On HF Spaces: Settings -> Variables and secrets -> add each as a SECRET.
 """
 
+import hmac
 import os
 import uuid
 
@@ -22,6 +23,46 @@ st.set_page_config(page_title="Playlist Agent", page_icon="🎵",
 # these one person with a refresh key ends the day for everyone.
 SESSION_TRACK_LIMIT = int(os.environ.get("SESSION_TRACK_LIMIT", "10"))
 SESSION_PLAYLIST_CAP = int(os.environ.get("SESSION_PLAYLIST_CAP", "2"))
+
+# ---------------------------------------------------------------------------
+# Access gate
+# ---------------------------------------------------------------------------
+# A public Space has no unlisted mode -- if it is reachable, it is findable. The
+# OAuth token writes to a real YouTube channel and the daily quota is shared
+# across all visitors, so an unguarded deploy lets a stranger spend both. Unset
+# DEMO_PASSWORD and the gate disappears entirely, which is what local runs want.
+DEMO_PASSWORD = os.environ.get("DEMO_PASSWORD", "")
+
+
+def authorized() -> bool:
+    if not DEMO_PASSWORD:
+        return True
+    if st.session_state.get("authed"):
+        return True
+
+    st.title("🎵 Playlist Agent")
+    st.caption("This is a portfolio demo. Enter the password from my resume "
+               "to try it.")
+    with st.form("gate"):
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Enter")
+
+    if submitted:
+        # compare_digest, not == : constant time, so the password can't be
+        # recovered a character at a time from response timing. Both sides are
+        # encoded because compare_digest rejects non-ASCII str.
+        if hmac.compare_digest(pw.encode("utf-8"),
+                               DEMO_PASSWORD.encode("utf-8")):
+            st.session_state.authed = True
+            st.rerun()
+        st.error("Wrong password.")
+    return False
+
+
+# Gate BEFORE get_app(): an unauthorized visitor should never wake the SQL
+# warehouse or build the graph.
+if not authorized():
+    st.stop()
 
 
 @st.cache_resource(show_spinner="Connecting to warehouse…")
