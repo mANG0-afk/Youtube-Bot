@@ -7,6 +7,7 @@ On HF Spaces: Settings -> Variables and secrets -> add each as a SECRET.
 """
 
 import hmac
+import json
 import os
 import uuid
 from contextlib import contextmanager
@@ -25,6 +26,105 @@ st.set_page_config(page_title="Playlist Agent", page_icon="🎵",
 SESSION_TRACK_LIMIT = int(os.environ.get("SESSION_TRACK_LIMIT", "10"))
 SESSION_PLAYLIST_CAP = int(os.environ.get("SESSION_PLAYLIST_CAP", "2"))
 
+EXAMPLES = ["top 10 hip-hop songs",
+            "songs of Arijit Singh",
+            "something sad for a long drive",
+            "make me a rock playlist"]
+
+YELLOW = "#FFD400"
+
+# ---------------------------------------------------------------------------
+# Styling
+# ---------------------------------------------------------------------------
+# Selectors are data-testid attributes rather than generated class names, which
+# Streamlit rewrites between versions. Everything degrades to the config.toml
+# palette if a selector ever stops matching, so a Streamlit upgrade can make
+# this plainer but not broken.
+st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {{ --yellow: {YELLOW}; --ink: #0A0A0A; }}
+
+html, body, [data-testid="stAppViewContainer"], button, input, textarea {{
+    font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Code',
+                 Consolas, 'Courier New', monospace !important;
+}}
+
+[data-testid="stAppViewContainer"] {{ background: var(--ink); }}
+[data-testid="stHeader"] {{ background: transparent; }}
+[data-testid="stMainBlockContainer"] {{ padding-top: 2.2rem; max-width: 46rem; }}
+
+/* Top strip: quota left, reset right */
+.topbar {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: .75rem; margin-bottom: 1.4rem;
+}}
+.quota {{
+    font-size: .72rem; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--yellow); border: 1px solid #3A3000; border-radius: 2px;
+    padding: .3rem .55rem; background: #1A1600; white-space: nowrap;
+}}
+.quota b {{ color: #FFF3B0; font-weight: 700; }}
+.quota.spent {{ color: #FF8A6B; border-color: #4A2318; background: #1F1210; }}
+
+h1.brand {{
+    font-size: 1.85rem !important; font-weight: 700 !important;
+    letter-spacing: -.02em; color: var(--yellow) !important;
+    margin: 0 0 .3rem 0 !important;
+}}
+p.tagline {{ color: #8C8C8C; font-size: .82rem; margin: 0 0 1.6rem 0; }}
+
+/* Search bar */
+[data-testid="stForm"] {{
+    border: 1px solid #2A2A2A; border-radius: 3px; background: #121212;
+    padding: .55rem .6rem;
+}}
+[data-testid="stForm"]:focus-within {{ border-color: var(--yellow); }}
+[data-testid="stForm"] input {{
+    background: transparent !important; border: none !important;
+    color: #EDEDED !important; font-size: .95rem !important;
+}}
+[data-testid="stForm"] input::placeholder {{ color: #5A5A5A !important; }}
+
+/* Buttons: the submit arrow is solid yellow, example chips are outlined */
+.stButton > button, [data-testid="stFormSubmitButton"] > button {{
+    border-radius: 2px; font-size: .78rem; font-weight: 500;
+    transition: background .12s, color .12s, border-color .12s;
+}}
+[data-testid="stFormSubmitButton"] > button {{
+    background: var(--yellow); color: var(--ink); border: none;
+    font-weight: 700; width: 100%;
+}}
+[data-testid="stFormSubmitButton"] > button:hover {{ background: #FFE45C; }}
+
+.chips .stButton > button {{
+    background: transparent; color: #B8B8B8; border: 1px solid #2E2E2E;
+    text-align: left; padding: .45rem .6rem;
+}}
+.chips .stButton > button:hover {{
+    border-color: var(--yellow); color: var(--yellow); background: #171400;
+}}
+.hint {{
+    color: #6E6E6E; font-size: .7rem; letter-spacing: .08em;
+    text-transform: uppercase; margin: 1.1rem 0 .55rem 0;
+}}
+
+/* Conversation */
+[data-testid="stChatMessage"] {{
+    background: #101010; border: 1px solid #232323; border-radius: 3px;
+    padding: .8rem .9rem; margin-bottom: .6rem;
+}}
+[data-testid="stChatMessage"] a {{ color: var(--yellow); }}
+
+.footer {{
+    margin-top: 2.6rem; padding-top: .9rem; border-top: 1px solid #1E1E1E;
+    color: #4E4E4E; font-size: .68rem; line-height: 1.7;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Access gate
 # ---------------------------------------------------------------------------
@@ -41,11 +141,13 @@ def authorized() -> bool:
     if st.session_state.get("authed"):
         return True
 
-    st.title("🎵 Playlist Agent")
-    st.caption("This is a portfolio demo. Enter the password from my resume "
-               "to try it.")
+    st.markdown('<h1 class="brand">PLAYLIST AGENT</h1>'
+                '<p class="tagline">Portfolio demo — enter the password from my '
+                'resume to try it.</p>', unsafe_allow_html=True)
     with st.form("gate"):
-        pw = st.text_input("Password", type="password")
+        pw = st.text_input("Password", type="password",
+                           label_visibility="collapsed",
+                           placeholder="password")
         submitted = st.form_submit_button("Enter")
 
     if submitted:
@@ -101,6 +203,31 @@ def text_of(msg) -> str:
         elif isinstance(b, dict) and b.get("type") == "text":
             parts.append(b.get("text", ""))
     return "\n".join(p for p in parts if p).strip()
+
+
+def written_url(out) -> str:
+    """
+    Last-resort reply built from the write tool's own result.
+
+    The quota is already spent and the playlist already exists by this point, so
+    the user has to get their link even when the model returns an empty message.
+    Reading it back out of the tool result is also more trustworthy than asking
+    the model to repeat a URL it could mangle.
+    """
+    for m in reversed(out.get("messages", [])):
+        if getattr(m, "name", None) not in ("create_youtube_playlist",
+                                            "add_to_youtube_playlist"):
+            continue
+        try:
+            data = json.loads(m.content)
+        except (ValueError, TypeError):
+            continue
+        url = data.get("playlist_url")
+        if url:
+            added = data.get("tracks_added")
+            count = f" with {added} tracks" if added else ""
+            return f"Your playlist is ready{count}: {url}"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -169,62 +296,39 @@ if "thread" not in st.session_state:
     st.session_state.history = []
     st.session_state.pending = None
     st.session_state.playlists_made = 0
+    st.session_state.query = None
 
 cfg = {"configurable": {"thread_id": st.session_state.thread}}
 
 
 # ---------------------------------------------------------------------------
-# Header + sidebar
+# Top strip -- quota sits top-left because a degraded mode needs explaining
+# before someone concludes the app is broken.
 # ---------------------------------------------------------------------------
-st.title("🎵 Playlist Agent")
-st.caption("Ask for songs by genre, artist, or mood. It builds a real YouTube "
-           "playlist you can open and play.")
-
-with st.sidebar:
-    st.subheader("How it works")
-    st.markdown(
-        "**Genre** → top tracks from a Databricks gold layer  \n"
-        "**Artist** → live Last.fm `artist.getTopTracks`  \n"
-        "**Mood** → tag search, falling back to top artists for that mood"
-    )
-
-    st.divider()
-    st.caption("Try one of these")
-    for ex in ["top 10 hip-hop songs",
-               "songs of Arijit Singh",
-               "something sad for a long drive",
-               "make me a rock playlist"]:
-        st.code(ex, language=None)
-
-    st.divider()
-    # Quota is shared, so surfacing it explains degraded mode rather than
-    # leaving visitors thinking the app is broken.
+def quota_chip() -> str:
     try:
         used = be.quota_used_today()
-        st.caption(f"YouTube quota today: {used:,} / {be.DAILY_BUDGET:,}")
-        st.progress(min(1.0, used / max(be.DAILY_BUDGET, 1)))
-        if used > be.DAILY_BUDGET:
-            st.warning("Playlist creation is paused until midnight Pacific. "
-                       "You'll still get track lists with links.")
     except Exception:
-        pass
+        return ""
+    spent = used > be.DAILY_BUDGET
+    label = ("QUOTA SPENT — TRACK LISTS ONLY" if spent
+             else f"YOUTUBE QUOTA TODAY <b>{used:,}</b> / {be.DAILY_BUDGET:,}")
+    return f'<span class="quota{" spent" if spent else ""}">{label}</span>'
 
-    if st.button("Start over"):
-        for k in ("thread", "history", "pending", "playlists_made"):
+
+bar_left, bar_right = st.columns([4, 1], vertical_alignment="center")
+bar_left.markdown(f'<div class="topbar">{quota_chip()}</div>',
+                  unsafe_allow_html=True)
+if st.session_state.history or st.session_state.pending:
+    if bar_right.button("reset", use_container_width=True):
+        for k in ("thread", "history", "pending", "playlists_made", "query"):
             st.session_state.pop(k, None)
         st.rerun()
 
-    st.divider()
-    st.caption("Databricks Lakeflow (bronze→silver→gold) · LangGraph · Last.fm "
-               "· YouTube Data API")
-
-
-# ---------------------------------------------------------------------------
-# History
-# ---------------------------------------------------------------------------
-for role, content in st.session_state.history:
-    with st.chat_message(role):
-        st.markdown(content)
+st.markdown('<h1 class="brand">PLAYLIST AGENT</h1>'
+            '<p class="tagline">Ask by genre, artist, or mood. It builds a real '
+            'YouTube playlist you can open and play.</p>',
+            unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +358,25 @@ if st.session_state.pending:
         st.session_state.pending = None
         if go:
             st.session_state.playlists_made += 1
+        out, reply = None, ""
         with st.spinner("Writing to YouTube…" if go else "Cancelling…"):
             try:
                 with trace_turn("approval_resume"):
                     out = app.invoke(Command(resume=bool(go)), cfg)
-                reply = text_of(out["messages"][-1])
             except Exception as e:
                 reply = f"Something went wrong: {type(e).__name__}"
+
+        if out is not None:
+            # A write can pause the graph AGAIN -- the model has been seen
+            # calling the other write tool right after a successful one. Carry
+            # that interrupt back into this gate. Dropping it left the graph
+            # parked mid-tool and showed the user an empty reply.
+            if "__interrupt__" in out:
+                st.session_state.pending = out["__interrupt__"][0].value
+                st.rerun()
+            reply = text_of(out["messages"][-1]) or written_url(out) or (
+                "Done." if go else "Cancelled — nothing was written.")
+
         st.session_state.history.append(("assistant", reply))
         st.rerun()
 
@@ -270,31 +386,73 @@ if st.session_state.pending:
 
 
 # ---------------------------------------------------------------------------
-# Input
+# Turn. Runs BEFORE the search bar is drawn: a query set by the form or a chip
+# arrives on the next rerun, so handling it first means the examples never flash
+# on screen during the turn that retires them.
 # ---------------------------------------------------------------------------
-prompt = st.chat_input("What should I put together?")
-if prompt:
+if st.session_state.query:
+    prompt = st.session_state.query
+    st.session_state.query = None
     st.session_state.history.append(("user", prompt))
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
     # Cap the size so "make me a 50 song playlist" can't drain the budget.
     sent = f"{prompt}\n\n(Use at most {SESSION_TRACK_LIMIT} tracks.)"
 
-    with st.chat_message("assistant"), st.spinner("Thinking…"):
+    with st.spinner("Thinking…"):
         try:
             with trace_turn("chat_turn"):
                 out = app.invoke({"messages": [("user", sent)]}, cfg)
         except Exception as e:
-            msg = f"Something went wrong: {type(e).__name__}"
-            st.markdown(msg)
-            st.session_state.history.append(("assistant", msg))
-            st.stop()
+            st.session_state.history.append(
+                ("assistant", f"Something went wrong: {type(e).__name__}"))
+            out = None
 
+    if out is not None:
         if "__interrupt__" in out:
             st.session_state.pending = out["__interrupt__"][0].value
-            st.rerun()
+        else:
+            st.session_state.history.append(
+                ("assistant", text_of(out["messages"][-1])))
+    st.rerun()
 
-        reply = text_of(out["messages"][-1])
-        st.markdown(reply)
-        st.session_state.history.append(("assistant", reply))
+
+# ---------------------------------------------------------------------------
+# Search bar, with the examples directly beneath it. They vanish after the
+# first query -- once there is a conversation they are noise.
+# ---------------------------------------------------------------------------
+with st.form("search", clear_on_submit=True):
+    field, send = st.columns([7, 1], vertical_alignment="center")
+    typed = field.text_input("Ask", label_visibility="collapsed",
+                             placeholder="What should I put together?")
+    submitted = send.form_submit_button("→")
+
+if submitted and typed.strip():
+    st.session_state.query = typed.strip()
+    st.rerun()
+
+if not st.session_state.history:
+    st.markdown('<p class="hint">Try one of these</p>', unsafe_allow_html=True)
+    st.markdown('<div class="chips">', unsafe_allow_html=True)
+    left, right = st.columns(2)
+    for i, ex in enumerate(EXAMPLES):
+        if (left if i % 2 == 0 else right).button(ex, key=f"ex{i}",
+                                                 use_container_width=True):
+            st.session_state.query = ex
+            st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# History -- newest turn last, below the input
+# ---------------------------------------------------------------------------
+for role, content in st.session_state.history:
+    with st.chat_message(role):
+        st.markdown(content)
+
+st.markdown(
+    '<div class="footer">'
+    'Databricks Lakeflow (bronze→silver→gold) · LangGraph · Last.fm · '
+    'YouTube Data API<br>'
+    'Genre → gold layer &nbsp;·&nbsp; Artist → Last.fm artist.getTopTracks '
+    '&nbsp;·&nbsp; Mood → tag search'
+    '</div>', unsafe_allow_html=True)

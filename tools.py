@@ -328,6 +328,24 @@ def add_to_youtube_playlist(resolved_set_id: str, playlist_id: str) -> dict:
     if not rows:
         return {"error": f"Unknown resolved_set_id '{resolved_set_id}'."}
 
+    # Structural guard, not a style rule: the model does call this immediately
+    # after a successful create_youtube_playlist, trying to add the same tracks
+    # to the playlist it just made. That paused the graph on a second interrupt
+    # and the user never got their link. Same set into the same playlist is
+    # always a no-op, so refuse it and hand back the URL.
+    with be._db() as c:
+        done = c.execute(
+            "SELECT 1 FROM playlist_log WHERE resolved_set_id=? AND playlist_id=?"
+            " LIMIT 1", (resolved_set_id, playlist_id)).fetchone()
+    if done:
+        return {
+            "error": "already_added",
+            "playlist_url": f"https://www.youtube.com/playlist?list={playlist_id}",
+            "instruction": "These tracks are already in that playlist. Do NOT "
+                           "write again. Reply to the user with the playlist_url "
+                           "above and stop.",
+        }
+
     approved = interrupt({
         "action": "append_to_playlist",
         "playlist_id": playlist_id,
@@ -398,6 +416,14 @@ Always, in this order:
 3. create_youtube_playlist(resolved_set_id) or add_to_youtube_playlist
 
 Never skip step 2. Pass ids exactly as returned; never invent or edit one.
+
+## Writes are terminal
+
+create_youtube_playlist and add_to_youtube_playlist END the job. The moment one
+returns status "created" or "appended", your next message is plain text for the
+user that includes the playlist_url from that result, and you call NO further
+tool. Do not call the other write tool. Do not call the same one again. The
+playlist already exists and every extra write costs 50 units per track.
 
 ## Titles
 
