@@ -9,6 +9,7 @@ On HF Spaces: Settings -> Variables and secrets -> add each as a SECRET.
 import hmac
 import os
 import uuid
+from contextlib import contextmanager
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -100,6 +101,54 @@ def text_of(msg) -> str:
         elif isinstance(b, dict) and b.get("type") == "text":
             parts.append(b.get("text", ""))
     return "\n".join(p for p in parts if p).strip()
+
+
+# ---------------------------------------------------------------------------
+# Tracing
+# ---------------------------------------------------------------------------
+# Set MLFLOW_EXPERIMENT to an experiment path (e.g. /Shared/playlist-agent) and
+# every turn is logged as a trace: the agent's reasoning, each tool call with its
+# arguments, latency and token counts. Leave it unset and nothing is traced, so
+# local runs stay offline and free.
+#
+# MLFLOW_TRACKING_URI defaults to "databricks" because the workspace is already
+# authenticated by the DATABRICKS_* vars. A local ./mlruns store would be wiped
+# on every Space restart, which is not monitoring.
+@st.cache_resource(show_spinner=False)
+def init_tracing() -> bool:
+    """Once per container. Never fatal -- monitoring must not take the app down."""
+    experiment = os.environ.get("MLFLOW_EXPERIMENT", "")
+    if not experiment:
+        return False
+    try:
+        import mlflow
+        mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI",
+                                               "databricks"))
+        mlflow.set_experiment(experiment)
+        mlflow.langchain.autolog()
+        return True
+    except Exception:
+        return False
+
+
+TRACING = init_tracing()
+
+
+@contextmanager
+def trace_turn(kind: str):
+    """
+    Wraps a turn so autolog's spans hang off a root span carrying the thread id
+    -- without it a trace cannot be tied back to the conversation it came from.
+    A no-op when tracing is off, so call sites stay unconditional.
+    """
+    if not TRACING:
+        yield
+        return
+    import mlflow
+    with mlflow.start_span(name=kind) as span:
+        span.set_attribute("thread_id", st.session_state.thread)
+        span.set_attribute("playlists_made", st.session_state.playlists_made)
+        yield
 
 
 try:
@@ -207,7 +256,8 @@ if st.session_state.pending:
             st.session_state.playlists_made += 1
         with st.spinner("Writing to YouTube…" if go else "Cancelling…"):
             try:
-                out = app.invoke(Command(resume=bool(go)), cfg)
+                with trace_turn("approval_resume"):
+                    out = app.invoke(Command(resume=bool(go)), cfg)
                 reply = text_of(out["messages"][-1])
             except Exception as e:
                 reply = f"Something went wrong: {type(e).__name__}"
@@ -233,7 +283,8 @@ if prompt:
 
     with st.chat_message("assistant"), st.spinner("Thinking…"):
         try:
-            out = app.invoke({"messages": [("user", sent)]}, cfg)
+            with trace_turn("chat_turn"):
+                out = app.invoke({"messages": [("user", sent)]}, cfg)
         except Exception as e:
             msg = f"Something went wrong: {type(e).__name__}"
             st.markdown(msg)
