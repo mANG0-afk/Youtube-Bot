@@ -112,6 +112,21 @@ p.tagline {{ color: #8C8C8C; font-size: .82rem; margin: 0 0 1.6rem 0; }}
     text-transform: uppercase; margin: 1.1rem 0 .55rem 0;
 }}
 
+/* Landing: owner key, then a visitor path */
+p.orbar {{
+    display: flex; align-items: center; gap: .8rem;
+    color: #5A5A5A; font-size: .7rem; letter-spacing: .12em;
+    text-transform: uppercase; margin: 1.1rem 0;
+}}
+p.orbar::before, p.orbar::after {{
+    content: ""; flex: 1; height: 1px; background: #232323;
+}}
+.modenote {{
+    margin-top: 1.8rem; padding-top: .9rem; border-top: 1px solid #1E1E1E;
+    color: #6E6E6E; font-size: .72rem; line-height: 1.9;
+}}
+.modenote b {{ color: var(--yellow); font-weight: 700; }}
+
 /* Conversation */
 [data-testid="stChatMessage"] {{
     background: #101010; border: 1px solid #232323; border-radius: 3px;
@@ -138,10 +153,58 @@ p.tagline {{ color: #8C8C8C; font-size: .82rem; margin: 0 0 1.6rem 0; }}
 OWNER_KEY = os.environ.get("OWNER_KEY", "")
 
 
-def is_owner() -> bool:
+def mode():
+    """
+    "owner", "visitor", or None while the choice is still open. With no OWNER_KEY
+    there is nothing to unlock, so a local run skips the choice and gets writes.
+    """
     if not OWNER_KEY:
-        return True
-    return bool(st.session_state.get("owner"))
+        return "owner"
+    return st.session_state.get("mode")
+
+
+def is_owner() -> bool:
+    return mode() == "owner"
+
+
+def choose_mode() -> None:
+    """
+    Landing screen. Rendered before get_app(), so somebody who never picks a mode
+    never wakes the SQL warehouse or builds a graph.
+    """
+    st.markdown('<h1 class="brand">PLAYLIST AGENT</h1>'
+                '<p class="tagline">Ask by genre, artist, or mood. It finds real '
+                'tracks and hands you a YouTube playlist you can play.</p>',
+                unsafe_allow_html=True)
+
+    with st.form("unlock", clear_on_submit=True):
+        key = st.text_input("Owner key", type="password",
+                            label_visibility="collapsed",
+                            placeholder="owner key")
+        if st.form_submit_button("Unlock owner mode"):
+            # compare_digest, not == : constant time, so the key can't be
+            # recovered a character at a time from response timing. Both sides
+            # are encoded because compare_digest rejects non-ASCII str.
+            if hmac.compare_digest(key.encode("utf-8"),
+                                   OWNER_KEY.encode("utf-8")):
+                st.session_state.mode = "owner"
+                st.rerun()
+            st.error("Wrong key.")
+
+    st.markdown('<p class="orbar">or</p>', unsafe_allow_html=True)
+
+    if st.button("Continue as visitor  →", use_container_width=True):
+        st.session_state.mode = "visitor"
+        st.rerun()
+
+    st.markdown(
+        '<div class="modenote">'
+        '<b>Visitor</b> — track lists plus a ready-to-play YouTube link you can '
+        'save to your own account.<br>'
+        '<b>Owner</b> — also creates the playlist directly on the owner\'s '
+        'channel.<br><br>'
+        'Reload the page to switch modes.'
+        '</div>', unsafe_allow_html=True)
 
 
 @st.cache_resource(show_spinner="Connecting to warehouse…")
@@ -280,6 +343,11 @@ def trace_turn(kind: str):
         span.set_attribute("thread_id", st.session_state.thread)
         span.set_attribute("playlists_made", st.session_state.playlists_made)
         yield
+
+
+if mode() is None:
+    choose_mode()
+    st.stop()
 
 
 try:
@@ -463,28 +531,3 @@ st.markdown(
     'Genre → gold layer &nbsp;·&nbsp; Artist → Last.fm artist.getTopTracks '
     '&nbsp;·&nbsp; Mood → tag search'
     '</div>', unsafe_allow_html=True)
-
-# Only rendered when there is something to unlock, so a local run (OWNER_KEY
-# unset, writes already on) shows nothing at all.
-if OWNER_KEY and not is_owner():
-    with st.expander("owner"):
-        with st.form("unlock", clear_on_submit=True):
-            key = st.text_input("Owner key", type="password",
-                                label_visibility="collapsed",
-                                placeholder="owner key")
-            if st.form_submit_button("Unlock playlist creation"):
-                # compare_digest, not == : constant time, so the key can't be
-                # recovered a character at a time from response timing. Both
-                # sides are encoded because compare_digest rejects non-ASCII str.
-                if hmac.compare_digest(key.encode("utf-8"),
-                                       OWNER_KEY.encode("utf-8")):
-                    st.session_state.owner = True
-                    # Start a fresh thread: the existing history was produced by
-                    # the read-only graph and references a tool set that no
-                    # longer matches the one about to be bound.
-                    st.session_state.thread = f"web-{uuid.uuid4().hex[:10]}"
-                    st.session_state.history = []
-                    st.session_state.pending = None
-                    st.session_state.query = None
-                    st.rerun()
-                st.error("Wrong key.")
