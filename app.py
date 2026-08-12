@@ -67,6 +67,8 @@ html, body, [data-testid="stAppViewContainer"], button, input, textarea {{
 }}
 .quota b {{ color: #FFF3B0; font-weight: 700; }}
 .quota.spent {{ color: #FF8A6B; border-color: #4A2318; background: #1F1210; }}
+.quota.owner {{ margin-left: .4rem; color: var(--ink); background: var(--yellow);
+                border-color: var(--yellow); font-weight: 700; }}
 
 h1.brand {{
     font-size: 1.85rem !important; font-weight: 700 !important;
@@ -126,54 +128,32 @@ p.tagline {{ color: #8C8C8C; font-size: .82rem; margin: 0 0 1.6rem 0; }}
 
 
 # ---------------------------------------------------------------------------
-# Access gate
+# Owner unlock
 # ---------------------------------------------------------------------------
-# A public Space has no unlisted mode -- if it is reachable, it is findable. The
-# OAuth token writes to a real YouTube channel and the daily quota is shared
-# across all visitors, so an unguarded deploy lets a stranger spend both. Unset
-# DEMO_PASSWORD and the gate disappears entirely, which is what local runs want.
-DEMO_PASSWORD = os.environ.get("DEMO_PASSWORD", "")
+# Nobody is kept out. Visitors get tracks and a ready-to-play preview link they
+# can save to their own account, which costs read quota but writes nothing.
+# Playlist CREATION uses the owner's OAuth token against the owner's channel, so
+# it unlocks only for whoever holds OWNER_KEY. Unset OWNER_KEY and writes are
+# simply on, which is what a local run wants.
+OWNER_KEY = os.environ.get("OWNER_KEY", "")
 
 
-def authorized() -> bool:
-    if not DEMO_PASSWORD:
+def is_owner() -> bool:
+    if not OWNER_KEY:
         return True
-    if st.session_state.get("authed"):
-        return True
-
-    st.markdown('<h1 class="brand">PLAYLIST AGENT</h1>'
-                '<p class="tagline">Portfolio demo — enter the password from my '
-                'resume to try it.</p>', unsafe_allow_html=True)
-    with st.form("gate"):
-        pw = st.text_input("Password", type="password",
-                           label_visibility="collapsed",
-                           placeholder="password")
-        submitted = st.form_submit_button("Enter")
-
-    if submitted:
-        # compare_digest, not == : constant time, so the password can't be
-        # recovered a character at a time from response timing. Both sides are
-        # encoded because compare_digest rejects non-ASCII str.
-        if hmac.compare_digest(pw.encode("utf-8"),
-                               DEMO_PASSWORD.encode("utf-8")):
-            st.session_state.authed = True
-            st.rerun()
-        st.error("Wrong password.")
-    return False
-
-
-# Gate BEFORE get_app(): an unauthorized visitor should never wake the SQL
-# warehouse or build the graph.
-if not authorized():
-    st.stop()
+    return bool(st.session_state.get("owner"))
 
 
 @st.cache_resource(show_spinner="Connecting to warehouse…")
-def get_app():
+def get_app(allow_writes: bool):
     """
-    Built once per container, not per rerun. Streamlit re-executes this whole
-    script on every interaction; without cache_resource the graph would be
-    rebuilt and the warehouse reconnected on every keystroke.
+    Built once per container per capability, not per rerun. Streamlit re-executes
+    this whole script on every interaction; without cache_resource the graph
+    would be rebuilt and the warehouse reconnected on every keystroke.
+
+    Keyed on allow_writes so the read-only and full graphs are separate cached
+    objects. cache_resource is shared across ALL sessions, so a single graph
+    holding the write tools would hand them to every visitor.
     """
     import sqlite3
     from langgraph.checkpoint.sqlite import SqliteSaver
@@ -185,7 +165,7 @@ def get_app():
     # NOT SqliteSaver.from_conn_string -- that is a context manager and would
     # close the connection immediately, losing the paused interrupt state.
     cp = SqliteSaver(sqlite3.connect("checkpoints.db", check_same_thread=False))
-    return tools.build_graph(cp), be, tools
+    return tools.build_graph(cp, allow_writes=allow_writes), be, tools
 
 
 def text_of(msg) -> str:
@@ -203,6 +183,30 @@ def text_of(msg) -> str:
         elif isinstance(b, dict) and b.get("type") == "text":
             parts.append(b.get("text", ""))
     return "\n".join(p for p in parts if p).strip()
+
+
+def preview_link(out) -> str:
+    """
+    The play link, built from resolve_to_youtube's own result.
+
+    This is the whole product for a visitor, and the model cannot be trusted to
+    reproduce it: asked to render the URL it retyped the video-id list as the
+    link label and corrupted it. So the model is told not to emit URLs at all and
+    the link is appended here, where it is always exact.
+    """
+    for m in reversed(out.get("messages", [])):
+        if getattr(m, "name", None) != "resolve_to_youtube":
+            continue
+        try:
+            data = json.loads(m.content)
+        except (ValueError, TypeError):
+            continue
+        url = data.get("preview_url")
+        if url:
+            n = data.get("resolved") or 0
+            return f"\n\n▶ **[Play all {n} tracks]({url})** — opens on YouTube; " \
+                   "hit Save there to keep it."
+    return ""
 
 
 def written_url(out) -> str:
@@ -279,7 +283,7 @@ def trace_turn(kind: str):
 
 
 try:
-    app, be, tools = get_app()
+    app, be, tools = get_app(is_owner())
 except Exception as e:
     st.error("Backend unavailable.")
     st.caption(f"{type(e).__name__}: {e}")
@@ -316,9 +320,12 @@ def quota_chip() -> str:
     return f'<span class="quota{" spent" if spent else ""}">{label}</span>'
 
 
+owner_badge = ('<span class="quota owner">OWNER</span>'
+               if OWNER_KEY and is_owner() else "")
 bar_left, bar_right = st.columns([4, 1], vertical_alignment="center")
-bar_left.markdown(f'<div class="topbar">{quota_chip()}</div>',
-                  unsafe_allow_html=True)
+bar_left.markdown(
+    f'<div class="topbar">{quota_chip()}{owner_badge}</div>',
+    unsafe_allow_html=True)
 if st.session_state.history or st.session_state.pending:
     if bar_right.button("reset", use_container_width=True):
         for k in ("thread", "history", "pending", "playlists_made", "query"):
@@ -412,7 +419,7 @@ if st.session_state.query:
             st.session_state.pending = out["__interrupt__"][0].value
         else:
             st.session_state.history.append(
-                ("assistant", text_of(out["messages"][-1])))
+                ("assistant", text_of(out["messages"][-1]) + preview_link(out)))
     st.rerun()
 
 
@@ -456,3 +463,28 @@ st.markdown(
     'Genre → gold layer &nbsp;·&nbsp; Artist → Last.fm artist.getTopTracks '
     '&nbsp;·&nbsp; Mood → tag search'
     '</div>', unsafe_allow_html=True)
+
+# Only rendered when there is something to unlock, so a local run (OWNER_KEY
+# unset, writes already on) shows nothing at all.
+if OWNER_KEY and not is_owner():
+    with st.expander("owner"):
+        with st.form("unlock", clear_on_submit=True):
+            key = st.text_input("Owner key", type="password",
+                                label_visibility="collapsed",
+                                placeholder="owner key")
+            if st.form_submit_button("Unlock playlist creation"):
+                # compare_digest, not == : constant time, so the key can't be
+                # recovered a character at a time from response timing. Both
+                # sides are encoded because compare_digest rejects non-ASCII str.
+                if hmac.compare_digest(key.encode("utf-8"),
+                                       OWNER_KEY.encode("utf-8")):
+                    st.session_state.owner = True
+                    # Start a fresh thread: the existing history was produced by
+                    # the read-only graph and references a tool set that no
+                    # longer matches the one about to be bound.
+                    st.session_state.thread = f"web-{uuid.uuid4().hex[:10]}"
+                    st.session_state.history = []
+                    st.session_state.pending = None
+                    st.session_state.query = None
+                    st.rerun()
+                st.error("Wrong key.")
