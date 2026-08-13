@@ -82,6 +82,7 @@ html, body, [data-testid="stAppViewContainer"], button, input, textarea {{
 .quota.owner {{ margin-left: .4rem; color: var(--ink); background: var(--yellow);
                 border-color: var(--yellow); font-weight: 700; }}
 .qsince {{ color: #8A7A3A; text-transform: none; letter-spacing: 0; }}
+.qsub {{ color: #9C8A45; font-weight: 400; }}
 
 h1.brand {{
     font-size: 1.85rem !important; font-weight: 700 !important;
@@ -206,6 +207,13 @@ def warmup() -> dict:
             import backend as be
             import tools            # noqa: F401 -- import IS the work
             be.init_app_state()
+            # Create the Delta quota ledger and seed the day's baseline here,
+            # where the thread is already waiting on the warehouse. Doing it on
+            # the first quota read instead would put a cold round-trip in front
+            # of a user.
+            be.ensure_quota_log()
+            be.flush_quota_log()
+            be.refresh_delta_units()   # populate the cache the chip reads
             status["ready"] = True
         except Exception as e:
             status["error"] = f"{type(e).__name__}: {e}"
@@ -414,6 +422,9 @@ def trace_turn(kind: str):
     -- without it a trace cannot be tied back to the conversation it came from.
     A no-op when tracing is off, so call sites stay unconditional.
     """
+    # Label this thread's quota events with the conversation that caused them,
+    # whether or not tracing is on -- the ledger is accounting, not telemetry.
+    be.set_quota_context(st.session_state.thread)
     if not TRACING:
         yield
         return
@@ -464,15 +475,18 @@ def quota_chip() -> str:
         since = be.quota_tracking_since()
     except Exception:
         return ""
+    left = max(0, be.DAILY_BUDGET - used)
     spent = used > be.DAILY_BUDGET
     if spent:
         label = "QUOTA SPENT — TRACK LISTS ONLY"
     else:
-        # ">=" is not pedantry: the ledger is local, so a redeploy resets it
-        # mid-day and a bare number would under-report real spend.
-        prefix = "&ge;" if since else ""
-        label = (f"YOUTUBE QUOTA TODAY {prefix}<b>{used:,}</b> / "
-                 f"{be.DAILY_BUDGET:,}")
+        # Remaining, not consumed: "how much is left" is the number anyone
+        # actually acts on. "<=" because spend is a lower bound when the durable
+        # ledger has not been read, so the headroom is an upper bound.
+        prefix = "&le;" if since else ""
+        label = (f"YOUTUBE QUOTA {prefix}<b>{left:,}</b> LEFT "
+                 f"<span class=\"qsub\">of {be.DAILY_BUDGET:,} · "
+                 f"{used:,} used</span>")
         if since:
             import datetime as _dt
             t = _dt.datetime.fromtimestamp(since).strftime("%H:%M")
@@ -544,6 +558,7 @@ if st.session_state.pending:
             reply = text_of(out["messages"][-1]) or written_url(out) or (
                 "Done." if go else "Cancelled — nothing was written.")
 
+        be.flush_quota_async()
         st.session_state.history.append(("assistant", reply))
         st.rerun()
 
@@ -580,6 +595,9 @@ if st.session_state.query:
         else:
             st.session_state.history.append(
                 ("assistant", text_of(out["messages"][-1]) + preview_link(out)))
+    # After the reply is built, not before: a Delta commit must never sit
+    # between the user's question and their answer.
+    be.flush_quota_async()
     st.rerun()
 
 

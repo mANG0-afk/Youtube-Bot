@@ -27,6 +27,7 @@ Optional:
   YT_DAILY_BUDGET  default 9000
 """
 
+import datetime as _dt
 import os
 import re
 import sqlite3
@@ -53,6 +54,19 @@ ARTIST_TRACKS_TTL_SEC = 7 * 24 * 3600
 
 # Stop spending YouTube quota below the 10,000/day ceiling, leaving headroom.
 DAILY_BUDGET = int(os.environ.get("YT_DAILY_BUDGET", "9000"))
+
+# Durable quota ledger. SQLite alone resets with the filesystem on every
+# redeploy, which made today's spend read as 0 on top of real usage.
+QUOTA_LOG = os.environ.get("QUOTA_LOG_TABLE", f"{CATALOG}.logging.quota_log")
+
+# thread_id of the turn currently being served. Thread-local, not global:
+# Streamlit runs each session's script in its own thread, so a plain global
+# would label one visitor's spend with another's conversation.
+_ctx = threading.local()
+
+
+def set_quota_context(thread_id: str) -> None:
+    _ctx.thread_id = thread_id
 
 
 # --------------------------------------------------------------------------
@@ -161,20 +175,29 @@ def _warehouse():
         return _conn
 
 
+# One connection is shared process-wide, and a single databricks-sql connection
+# is not safe for concurrent cursors -- two threads issuing statements at once
+# hang rather than error. Background quota flushes made that a real possibility,
+# so all statement execution is serialised. Acquired before _conn_lock, always in
+# that order, so the pair cannot deadlock.
+_use_lock = threading.Lock()
+
+
 def query(sql: str, params: Optional[dict] = None) -> list[dict]:
     """Named :param markers, so user input is never interpolated into SQL."""
     global _conn
-    for attempt in range(2):
-        try:
-            with _warehouse().cursor() as cur:
-                cur.execute(sql, parameters=params or {})
-                cols = [c[0] for c in cur.description]
-                return [dict(zip(cols, r)) for r in cur.fetchall()]
-        except Exception:
-            with _conn_lock:
-                _conn = None          # stale/expired connection, rebuild once
-            if attempt:
-                raise
+    with _use_lock:
+        for attempt in range(2):
+            try:
+                with _warehouse().cursor() as cur:
+                    cur.execute(sql, parameters=params or {})
+                    cols = [c[0] for c in cur.description]
+                    return [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception:
+                with _conn_lock:
+                    _conn = None      # stale/expired connection, rebuild once
+                if attempt:
+                    raise
     return []
 
 
@@ -237,9 +260,72 @@ def init_app_state():
         -- 0 -- the app would report a clean budget on top of real spend.
         CREATE TABLE IF NOT EXISTS quota_epoch (
             day TEXT PRIMARY KEY, started_at REAL);
+
+        -- Write-ahead buffer for the Delta ledger. Every unit of YouTube spend
+        -- lands here first, synchronously and cheaply; a background flush
+        -- appends it to Delta. synced=0 rows are spend Delta has not seen yet,
+        -- which is exactly what has to be added to the Delta total to get the
+        -- true figure without double counting.
+        CREATE TABLE IF NOT EXISTS quota_event (
+            event_id TEXT PRIMARY KEY, ts REAL, pacific_day TEXT,
+            operation TEXT, units INTEGER, thread_id TEXT,
+            synced INTEGER DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS ix_quota_event_unsynced
+            ON quota_event (synced, pacific_day);
         """)
         c.execute("INSERT OR IGNORE INTO quota_epoch VALUES (?,?)",
                   (_pacific_day_key(), time.time()))
+    _backfill_quota_events()
+
+
+def _backfill_quota_events() -> None:
+    """
+    One-time migration. Spend used to be derived from youtube_resolution and
+    playlist_log rather than logged as events, so on the first run after this
+    change today's already-spent units would otherwise read as zero -- the exact
+    under-reporting this ledger exists to stop.
+    """
+    day, since = _pacific_day_key(), _pacific_day_start()
+    with _db() as c:
+        if c.execute("SELECT 1 FROM quota_event WHERE pacific_day=? LIMIT 1",
+                     (day,)).fetchone():
+            return
+        # Deterministic event_ids, so running this twice cannot double count --
+        # the local PK ignores the repeat and the Delta read dedupes by id.
+        events = []
+        for r in c.execute("SELECT artist_key, track_key FROM youtube_resolution "
+                           "WHERE resolved_at > ?", (since,)):
+            events.append((f"bf:{day}:search:{r['artist_key']}:{r['track_key']}",
+                           since, day, "search", 100, "", 0))
+        lists = set()
+        for r in c.execute("SELECT playlist_id, video_id FROM playlist_log "
+                           "WHERE added_at > ?", (since,)):
+            events.append((f"bf:{day}:item:{r['playlist_id']}:{r['video_id']}",
+                           since, day, "playlist_item_insert", 50, "", 0))
+            lists.add(r["playlist_id"])
+        for pid in lists:
+            events.append((f"bf:{day}:list:{pid}",
+                           since, day, "playlist_insert", 50, "", 0))
+        if events:
+            c.executemany("INSERT OR IGNORE INTO quota_event "
+                          "VALUES (?,?,?,?,?,?,?)", events)
+
+
+def record_quota(operation: str, units: int) -> None:
+    """
+    Log one unit of spend. Never raises: quota accounting failing must not fail
+    the request that was already paid for.
+    """
+    try:
+        with _db() as c:
+            c.execute(
+                "INSERT INTO quota_event "
+                "(event_id, ts, pacific_day, operation, units, thread_id, synced)"
+                " VALUES (?,?,?,?,?,?,0)",
+                (uuid.uuid4().hex, time.time(), _pacific_day_key(), operation,
+                 int(units), getattr(_ctx, "thread_id", "")))
+    except Exception:
+        pass
 
 
 def save_candidate_set(rows: list[dict], source: str) -> str:
@@ -322,10 +408,12 @@ def quota_tracking_since() -> Optional[float]:
     """
     When this database started counting today, or None if it has counted all day.
 
-    A redeploy wipes the SQLite ledger, so spend logged before it is invisible.
-    Returning the epoch lets the caller say ">= 2,700 since 14:20" instead of
-    presenting a reset counter as fact.
+    Returns None once the Delta total has actually been read, because the figure
+    is then durable and complete and the ">=" caveat would be false modesty. Only
+    the SQLite-only fallback needs the disclaimer.
     """
+    if quota_ledger_live():
+        return None
     day_start = _pacific_day_start()
     with _db() as c:
         row = c.execute("SELECT started_at FROM quota_epoch WHERE day=?",
@@ -337,17 +425,145 @@ def quota_tracking_since() -> Optional[float]:
     return None if row["started_at"] <= day_start + 60 else row["started_at"]
 
 
-def quota_used_today() -> int:
-    """Lower bound: only counts what this app logged. 100/search, 50/write."""
-    since = _pacific_day_start()
+_ledger_lock = threading.Lock()
+_ledger = {"delta_units": 0, "read_at": 0.0, "available": None}
+LEDGER_TTL_SEC = 120
+
+
+def ensure_quota_log() -> bool:
+    """
+    Create the Delta ledger if absent. Called from the warm-up thread, never at
+    import -- it is a warehouse round-trip. Returns False if the table cannot be
+    created or read, in which case everything degrades to SQLite-only counting.
+    """
+    with _ledger_lock:
+        if _ledger["available"] is not None:
+            return _ledger["available"]
+    ok = False
+    try:
+        query(f"""
+            CREATE TABLE IF NOT EXISTS {QUOTA_LOG} (
+                event_id   STRING,
+                event_ts   TIMESTAMP,
+                pacific_day DATE,
+                operation  STRING,
+                units      INT,
+                thread_id  STRING
+            ) USING DELTA
+        """)
+        ok = True
+    except Exception:
+        ok = False
+    with _ledger_lock:
+        _ledger["available"] = ok
+    return ok
+
+
+def _delta_units_today() -> int:
+    """
+    Last known Delta total for the Pacific day. Reads the cache and NOTHING else.
+
+    Never queries. This sits behind the quota chip, which re-renders on every
+    Streamlit interaction, and a cold warehouse round-trip is ~25s -- querying
+    here froze the page on whichever click happened to find the cache stale,
+    which presented as the quota display having disappeared.
+    """
+    with _ledger_lock:
+        return _ledger["delta_units"]
+
+
+def refresh_delta_units() -> int:
+    """
+    Re-read the Delta total. Called from background threads only -- warm-up and
+    after a flush, which is exactly when the figure can have changed.
+    """
+    with _ledger_lock:
+        if _ledger["available"] is False:
+            return 0
+    try:
+        # DISTINCT event_id, not a bare SUM: the flush marks rows synced only
+        # after a successful append, so a crash in between re-sends them. Dedupe
+        # on read makes that harmless instead of inflating the day's spend.
+        rows = query(
+            f"SELECT COALESCE(SUM(units), 0) AS n FROM ("
+            f"  SELECT DISTINCT event_id, units FROM {QUOTA_LOG}"
+            f"  WHERE pacific_day = CAST(:d AS DATE))",
+            {"d": _pacific_day_key()})
+        units = int(rows[0]["n"]) if rows else 0
+        with _ledger_lock:
+            _ledger["delta_units"] = units
+            _ledger["read_at"] = time.time()
+        return units
+    except Exception:
+        return _delta_units_today()
+
+
+def quota_ledger_live() -> bool:
+    """True once the Delta total has actually been read at least once."""
+    with _ledger_lock:
+        return _ledger["read_at"] > 0
+
+
+def flush_quota_log() -> int:
+    """
+    Append unsynced local events to Delta as ONE insert, then mark them synced.
+
+    One commit per flush rather than per event: Delta commits cost seconds, and
+    a 10-track resolve would otherwise mean 10 of them. Marked synced only after
+    a successful append, so a crash in between re-sends rows and over-counts --
+    which errs toward degrading the app early rather than overspending.
+    """
+    if not ensure_quota_log():
+        return 0
     with _db() as c:
-        searches = c.execute(
-            "SELECT count(*) AS n FROM youtube_resolution WHERE resolved_at > ?",
-            (since,)).fetchone()["n"]
-        row = c.execute(
-            "SELECT count(*) AS items, count(DISTINCT playlist_id) AS lists "
-            "FROM playlist_log WHERE added_at > ?", (since,)).fetchone()
-    return searches * 100 + row["items"] * 50 + row["lists"] * 50
+        rows = [dict(r) for r in c.execute(
+            "SELECT event_id, ts, pacific_day, operation, units, thread_id "
+            "FROM quota_event WHERE synced = 0 ORDER BY ts LIMIT 500")]
+    if not rows:
+        return 0
+
+    tuples, params = [], {}
+    for i, r in enumerate(rows):
+        tuples.append(f"(:e{i}, CAST(:t{i} AS TIMESTAMP), "
+                      f"CAST(:d{i} AS DATE), :o{i}, :u{i}, :h{i})")
+        params[f"e{i}"] = r["event_id"]
+        params[f"t{i}"] = _dt.datetime.fromtimestamp(
+            r["ts"], _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        params[f"d{i}"] = r["pacific_day"]
+        params[f"o{i}"] = r["operation"]
+        params[f"u{i}"] = int(r["units"])
+        params[f"h{i}"] = r["thread_id"] or ""
+    try:
+        query(f"INSERT INTO {QUOTA_LOG} VALUES {', '.join(tuples)}", params)
+    except Exception:
+        return 0
+
+    with _db() as c:
+        c.executemany("UPDATE quota_event SET synced = 1 WHERE event_id = ?",
+                      [(r["event_id"],) for r in rows])
+    refresh_delta_units()
+    return len(rows)
+
+
+def flush_quota_async() -> None:
+    """Fire-and-forget, so a turn never waits on a Delta commit."""
+    threading.Thread(target=lambda: flush_quota_log(), daemon=True).start()
+
+
+def quota_used_today() -> int:
+    """
+    Delta total for the Pacific day plus local spend Delta has not seen yet.
+
+    Splitting it this way is what makes the figure survive a redeploy without
+    double counting: Delta holds every flushed event from every container
+    lifetime, and synced=0 holds exactly the remainder.
+    """
+    with _db() as c:
+        local = c.execute(
+            "SELECT COALESCE(SUM(units), 0) AS n FROM quota_event "
+            "WHERE synced = 0 AND pacific_day = ?",
+            (_pacific_day_key(),)).fetchone()["n"]
+    return _delta_units_today() + int(local)
 
 
 def search_url(artist_name: str, track_name: str) -> str:
@@ -765,6 +981,8 @@ def youtube_find_video(artist_key: str, track_key: str, artist_name: str,
         vtitle = items[0]["snippet"]["title"]
         channel = items[0]["snippet"]["channelTitle"]
 
+    # Logged whether or not a video was found: a miss still cost 100 units.
+    record_quota("search", 100)
     with _db() as c:
         c.execute("INSERT OR REPLACE INTO youtube_resolution VALUES (?,?,?,?,?,?)",
                   (artist_key, track_key, vid, vtitle, channel, time.time()))
@@ -779,6 +997,7 @@ def youtube_create_playlist(title: str, description: str = "") -> str:
                           "description": description[:1000]},
               "status": {"privacyStatus": "public"}},
     ).execute()
+    record_quota("playlist_insert", 50)
     return resp["id"]
 
 
@@ -806,6 +1025,7 @@ def youtube_add_items(playlist_id: str, videos: list[dict],
                     "resourceId": {"kind": "youtube#video",
                                    "videoId": v["video_id"]}}},
             ).execute()
+            record_quota("playlist_item_insert", 50)
             with _db() as c:
                 c.execute("INSERT OR REPLACE INTO playlist_log VALUES (?,?,?,?)",
                           (playlist_id, v["video_id"], resolved_set_id,
