@@ -11,3 +11,6 @@ google-auth>=2.35
 requests>=2.32
 python-dotenv>=1.0
 mlflow>=3.0
+# zoneinfo has no bundled database; slim Linux images carry no system one
+# either, and quota resets are computed in America/Los_Angeles.
+tzdata>=2024.1

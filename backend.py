@@ -388,9 +388,22 @@ def _search_query(artist_name: str, track_name: str) -> str:
 # and the app looks broken for a whole evening.
 # --------------------------------------------------------------------------
 def _pacific_now():
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/Los_Angeles"))
+    """
+    Now, in the timezone YouTube resets quota in.
+
+    Falls back to a fixed -08:00 rather than raising: zoneinfo needs either a
+    system tz database or the tzdata package, and slim Linux containers ship
+    neither. Every quota function routes through here, so a missing tz database
+    took out the whole quota display in deployment. The fallback is wrong by an
+    hour during daylight saving, which shifts the reset boundary by an hour --
+    far better than losing quota accounting entirely.
+    """
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=-8)))
 
 
 def _pacific_day_start() -> float:

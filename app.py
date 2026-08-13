@@ -473,8 +473,12 @@ def quota_chip() -> str:
     try:
         used = be.quota_used_today()
         since = be.quota_tracking_since()
-    except Exception:
-        return ""
+    except Exception as e:
+        # Render the failure instead of returning "". A silent empty string is
+        # why this went unnoticed in deployment: the chip simply was not there,
+        # with nothing on screen or in the logs to say why.
+        return (f'<span class="quota spent">QUOTA UNAVAILABLE — '
+                f'{type(e).__name__}</span>')
     left = max(0, be.DAILY_BUDGET - used)
     spent = used > be.DAILY_BUDGET
     if spent:
