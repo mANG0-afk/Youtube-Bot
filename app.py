@@ -15,8 +15,20 @@ from contextlib import contextmanager
 import streamlit as st
 from dotenv import load_dotenv
 
-# Loads secrets.env locally; a no-op on HF where env vars already exist.
+# Loads secrets.env locally; a no-op on hosts where env vars already exist.
 load_dotenv("secrets.env")
+
+# Streamlit Community Cloud delivers secrets through st.secrets rather than the
+# environment, but backend.py and tools.py read os.environ (and are imported by a
+# background thread that has no Streamlit context to read st.secrets from). Copy
+# them across before anything imports those modules. setdefault, so a real
+# environment variable or secrets.env still wins.
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, (str, int, float, bool)):
+            os.environ.setdefault(_k, str(_v))
+except Exception:
+    pass        # no secrets.toml -- normal locally and on env-var hosts
 
 st.set_page_config(page_title="Playlist Agent", page_icon="🎵",
                    layout="centered")
