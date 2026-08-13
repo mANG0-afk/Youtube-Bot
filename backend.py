@@ -175,20 +175,29 @@ def _warehouse():
         return _conn
 
 
+# One connection is shared process-wide, and a single databricks-sql connection
+# is not safe for concurrent cursors -- two threads issuing statements at once
+# hang rather than error. Background quota flushes made that a real possibility,
+# so all statement execution is serialised. Acquired before _conn_lock, always in
+# that order, so the pair cannot deadlock.
+_use_lock = threading.Lock()
+
+
 def query(sql: str, params: Optional[dict] = None) -> list[dict]:
     """Named :param markers, so user input is never interpolated into SQL."""
     global _conn
-    for attempt in range(2):
-        try:
-            with _warehouse().cursor() as cur:
-                cur.execute(sql, parameters=params or {})
-                cols = [c[0] for c in cur.description]
-                return [dict(zip(cols, r)) for r in cur.fetchall()]
-        except Exception:
-            with _conn_lock:
-                _conn = None          # stale/expired connection, rebuild once
-            if attempt:
-                raise
+    with _use_lock:
+        for attempt in range(2):
+            try:
+                with _warehouse().cursor() as cur:
+                    cur.execute(sql, parameters=params or {})
+                    cols = [c[0] for c in cur.description]
+                    return [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception:
+                with _conn_lock:
+                    _conn = None      # stale/expired connection, rebuild once
+                if attempt:
+                    raise
     return []
 
 
@@ -399,13 +408,12 @@ def quota_tracking_since() -> Optional[float]:
     """
     When this database started counting today, or None if it has counted all day.
 
-    Returns None once the Delta ledger is reachable, because the figure is then
-    durable and complete and the ">=" caveat would be false modesty. Only the
-    SQLite-only fallback needs the disclaimer.
+    Returns None once the Delta total has actually been read, because the figure
+    is then durable and complete and the ">=" caveat would be false modesty. Only
+    the SQLite-only fallback needs the disclaimer.
     """
-    with _ledger_lock:
-        if _ledger["available"]:
-            return None
+    if quota_ledger_live():
+        return None
     day_start = _pacific_day_start()
     with _db() as c:
         row = c.execute("SELECT started_at FROM quota_epoch WHERE day=?",
@@ -451,19 +459,25 @@ def ensure_quota_log() -> bool:
     return ok
 
 
-def _delta_units_today(force: bool = False) -> int:
+def _delta_units_today() -> int:
     """
-    Spend already in Delta for the current Pacific day, cached for 2 minutes.
+    Last known Delta total for the Pacific day. Reads the cache and NOTHING else.
 
-    Cached because the quota chip renders on every Streamlit rerun and a
-    warehouse round-trip per click would be felt. Staleness only matters when a
-    second container is spending concurrently, and it self-corrects on the next
-    read.
+    Never queries. This sits behind the quota chip, which re-renders on every
+    Streamlit interaction, and a cold warehouse round-trip is ~25s -- querying
+    here froze the page on whichever click happened to find the cache stale,
+    which presented as the quota display having disappeared.
     """
     with _ledger_lock:
-        fresh = time.time() - _ledger["read_at"] < LEDGER_TTL_SEC
-        if fresh and not force:
-            return _ledger["delta_units"]
+        return _ledger["delta_units"]
+
+
+def refresh_delta_units() -> int:
+    """
+    Re-read the Delta total. Called from background threads only -- warm-up and
+    after a flush, which is exactly when the figure can have changed.
+    """
+    with _ledger_lock:
         if _ledger["available"] is False:
             return 0
     try:
@@ -481,7 +495,13 @@ def _delta_units_today(force: bool = False) -> int:
             _ledger["read_at"] = time.time()
         return units
     except Exception:
-        return _ledger["delta_units"]
+        return _delta_units_today()
+
+
+def quota_ledger_live() -> bool:
+    """True once the Delta total has actually been read at least once."""
+    with _ledger_lock:
+        return _ledger["read_at"] > 0
 
 
 def flush_quota_log() -> int:
@@ -521,7 +541,7 @@ def flush_quota_log() -> int:
     with _db() as c:
         c.executemany("UPDATE quota_event SET synced = 1 WHERE event_id = ?",
                       [(r["event_id"],) for r in rows])
-    _delta_units_today(force=True)
+    refresh_delta_units()
     return len(rows)
 
 

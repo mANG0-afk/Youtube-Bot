@@ -82,6 +82,7 @@ html, body, [data-testid="stAppViewContainer"], button, input, textarea {{
 .quota.owner {{ margin-left: .4rem; color: var(--ink); background: var(--yellow);
                 border-color: var(--yellow); font-weight: 700; }}
 .qsince {{ color: #8A7A3A; text-transform: none; letter-spacing: 0; }}
+.qsub {{ color: #9C8A45; font-weight: 400; }}
 
 h1.brand {{
     font-size: 1.85rem !important; font-weight: 700 !important;
@@ -212,6 +213,7 @@ def warmup() -> dict:
             # of a user.
             be.ensure_quota_log()
             be.flush_quota_log()
+            be.refresh_delta_units()   # populate the cache the chip reads
             status["ready"] = True
         except Exception as e:
             status["error"] = f"{type(e).__name__}: {e}"
@@ -473,15 +475,18 @@ def quota_chip() -> str:
         since = be.quota_tracking_since()
     except Exception:
         return ""
+    left = max(0, be.DAILY_BUDGET - used)
     spent = used > be.DAILY_BUDGET
     if spent:
         label = "QUOTA SPENT — TRACK LISTS ONLY"
     else:
-        # ">=" is not pedantry: the ledger is local, so a redeploy resets it
-        # mid-day and a bare number would under-report real spend.
-        prefix = "&ge;" if since else ""
-        label = (f"YOUTUBE QUOTA TODAY {prefix}<b>{used:,}</b> / "
-                 f"{be.DAILY_BUDGET:,}")
+        # Remaining, not consumed: "how much is left" is the number anyone
+        # actually acts on. "<=" because spend is a lower bound when the durable
+        # ledger has not been read, so the headroom is an upper bound.
+        prefix = "&le;" if since else ""
+        label = (f"YOUTUBE QUOTA {prefix}<b>{left:,}</b> LEFT "
+                 f"<span class=\"qsub\">of {be.DAILY_BUDGET:,} · "
+                 f"{used:,} used</span>")
         if since:
             import datetime as _dt
             t = _dt.datetime.fromtimestamp(since).strftime("%H:%M")
