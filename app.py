@@ -206,6 +206,12 @@ def warmup() -> dict:
             import backend as be
             import tools            # noqa: F401 -- import IS the work
             be.init_app_state()
+            # Create the Delta quota ledger and seed the day's baseline here,
+            # where the thread is already waiting on the warehouse. Doing it on
+            # the first quota read instead would put a cold round-trip in front
+            # of a user.
+            be.ensure_quota_log()
+            be.flush_quota_log()
             status["ready"] = True
         except Exception as e:
             status["error"] = f"{type(e).__name__}: {e}"
@@ -414,6 +420,9 @@ def trace_turn(kind: str):
     -- without it a trace cannot be tied back to the conversation it came from.
     A no-op when tracing is off, so call sites stay unconditional.
     """
+    # Label this thread's quota events with the conversation that caused them,
+    # whether or not tracing is on -- the ledger is accounting, not telemetry.
+    be.set_quota_context(st.session_state.thread)
     if not TRACING:
         yield
         return
@@ -544,6 +553,7 @@ if st.session_state.pending:
             reply = text_of(out["messages"][-1]) or written_url(out) or (
                 "Done." if go else "Cancelled — nothing was written.")
 
+        be.flush_quota_async()
         st.session_state.history.append(("assistant", reply))
         st.rerun()
 
@@ -580,6 +590,9 @@ if st.session_state.query:
         else:
             st.session_state.history.append(
                 ("assistant", text_of(out["messages"][-1]) + preview_link(out)))
+    # After the reply is built, not before: a Delta commit must never sit
+    # between the user's question and their answer.
+    be.flush_quota_async()
     st.rerun()
 
 
