@@ -328,6 +328,24 @@ def add_to_youtube_playlist(resolved_set_id: str, playlist_id: str) -> dict:
     if not rows:
         return {"error": f"Unknown resolved_set_id '{resolved_set_id}'."}
 
+    # Structural guard, not a style rule: the model does call this immediately
+    # after a successful create_youtube_playlist, trying to add the same tracks
+    # to the playlist it just made. That paused the graph on a second interrupt
+    # and the user never got their link. Same set into the same playlist is
+    # always a no-op, so refuse it and hand back the URL.
+    with be._db() as c:
+        done = c.execute(
+            "SELECT 1 FROM playlist_log WHERE resolved_set_id=? AND playlist_id=?"
+            " LIMIT 1", (resolved_set_id, playlist_id)).fetchone()
+    if done:
+        return {
+            "error": "already_added",
+            "playlist_url": f"https://www.youtube.com/playlist?list={playlist_id}",
+            "instruction": "These tracks are already in that playlist. Do NOT "
+                           "write again. Reply to the user with the playlist_url "
+                           "above and stop.",
+        }
+
     approved = interrupt({
         "action": "append_to_playlist",
         "playlist_id": playlist_id,
@@ -347,17 +365,24 @@ def add_to_youtube_playlist(resolved_set_id: str, playlist_id: str) -> dict:
     }
 
 
-TOOLS = [
+# Reads cost YouTube quota but touch nobody's account. Writes mutate a real
+# channel, so they are bound only for the owner -- see build_graph(allow_writes).
+READ_TOOLS = [
     find_tracks_by_genre,
     find_tracks_by_artist,
     find_tracks_by_mood,
     resolve_to_youtube,
+]
+
+WRITE_TOOLS = [
     create_youtube_playlist,
     add_to_youtube_playlist,
 ]
 
+TOOLS = READ_TOOLS + WRITE_TOOLS
 
-SYSTEM = f"""You are a music playlist assistant.
+
+_SYSTEM_BASE = f"""You are a music playlist assistant.
 
 Genres in the catalogue: {', '.join(GENRES)}
 Moods supported: {', '.join(MOODS)}
@@ -390,6 +415,16 @@ different find_tracks_* tool to compensate. If find_tracks_by_artist fails for
 an artist, say so -- do not return mood-based or genre-based songs instead.
 Returning the wrong kind of result is worse than returning none.
 
+## Truthfulness
+
+Only name tracks a tool actually returned. If a tool reports count 30 with a
+preview of 10, say 30 and list the 10 you were given. Never fill a list from
+your own knowledge of an artist's discography."""
+
+
+# Appended for the owner, who has the write tools bound.
+_WRITE_MODE = """
+
 ## Sequence
 
 Always, in this order:
@@ -398,22 +433,69 @@ Always, in this order:
 3. create_youtube_playlist(resolved_set_id) or add_to_youtube_playlist
 
 Never skip step 2. Pass ids exactly as returned; never invent or edit one.
+After resolve_to_youtube, share the preview_url so the user can listen before
+committing.
+
+## Writes are terminal
+
+create_youtube_playlist and add_to_youtube_playlist END the job. The moment one
+returns status "created" or "appended", your next message is plain text for the
+user that includes the playlist_url from that result, and you call NO further
+tool. Do not call the other write tool. Do not call the same one again. The
+playlist already exists and every extra write costs 50 units per track.
 
 ## Titles
 
 Omit `title` and it is auto-named from the artist, genre or mood. Pass a title
-only when the user asked for a specific name.
-
-## Truthfulness
-
-Only name tracks a tool actually returned. If a tool reports count 30 with a
-preview of 10, say 30 and list the 10 you were given. Never fill a list from
-your own knowledge of an artist's discography.
-After resolve_to_youtube, share the preview_url so the user can listen before
-committing."""
+only when the user asked for a specific name."""
 
 
-def build_graph(checkpointer):
+# Appended for visitors, who have no write tools bound at all. Saying so plainly
+# matters: a model asked to do something it has no tool for tends to either claim
+# it did or describe the call in prose, and both read as a broken app.
+_READ_ONLY = """
+
+## Sequence
+
+Always, in this order:
+1. a find_tracks_* tool          -> returns candidate_set_id
+2. resolve_to_youtube(candidate_set_id) -> returns resolved_set_id
+
+Never skip step 2. Pass ids exactly as returned; never invent or edit one.
+
+## Finish with the preview link
+
+You have NO tool that creates or edits a YouTube playlist. Do not offer to make
+one, do not claim to have made one, and never write a tool call as text.
+
+resolve_to_youtube is the last step. Reply with the track list, then say that the
+play link below opens all the tracks in order and that YouTube's own Save button
+adds them to their library.
+
+Do NOT paste the preview_url, or any other URL, into your reply. The app renders
+the link itself from the tool result. Asked to retype a long URL you mangle it,
+and a broken link is the one thing this demo cannot afford.
+
+If the user asks you to create or save a playlist for them, say that this demo
+resolves tracks and hands back a ready-to-play link they can save themselves."""
+
+
+def system_prompt(allow_writes: bool) -> str:
+    return _SYSTEM_BASE + (_WRITE_MODE if allow_writes else _READ_ONLY)
+
+
+# Retained for callers that just want the full-capability prompt.
+SYSTEM = system_prompt(True)
+
+
+def build_graph(checkpointer, allow_writes: bool = True):
+    """
+    allow_writes=False binds only the read tools and swaps in the read-only
+    prompt. Withholding the tool is the control; the prompt only explains the
+    absence. Telling a model it "may not" use a tool it can still see invites it
+    to try anyway, and the approval interrupt would then fire for a visitor who
+    has no business writing to the owner's channel.
+    """
     from langchain_core.utils.function_calling import convert_to_openai_tool
 
     def sanitize(s):
@@ -428,7 +510,9 @@ def build_graph(checkpointer):
             return [sanitize(v) for v in s]
         return s
 
-    specs = [sanitize(convert_to_openai_tool(t)) for t in TOOLS]
+    bound = TOOLS if allow_writes else READ_TOOLS
+    specs = [sanitize(convert_to_openai_tool(t)) for t in bound]
+    prompt = system_prompt(allow_writes)
 
     # llama-4-maverick and gpt-oss/qwen on Databricks stop emitting structured
     # tool_calls once the history holds TWO tool round-trips -- they fall back to
@@ -442,11 +526,11 @@ def build_graph(checkpointer):
         temperature=0).bind(tools=specs)
 
     def agent(state: AgentState):
-        return {"messages": [llm.invoke([SystemMessage(SYSTEM)] + state["messages"])]}
+        return {"messages": [llm.invoke([SystemMessage(prompt)] + state["messages"])]}
 
     g = StateGraph(AgentState)
     g.add_node("agent", agent)
-    g.add_node("tools", ToolNode(TOOLS))
+    g.add_node("tools", ToolNode(bound))
     g.add_edge(START, "agent")
     g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
     g.add_edge("tools", "agent")

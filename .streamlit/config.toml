@@ -1,0 +1,10 @@
+# Base palette. Streamlit paints its own widgets from these, so setting them
+# here means the CSS in app.py only has to handle layout and accents rather
+# than fighting default colours on every control.
+[theme]
+base = "dark"
+primaryColor = "#FFD400"
+backgroundColor = "#0A0A0A"
+secondaryBackgroundColor = "#151515"
+textColor = "#EDEDED"
+font = "monospace"
