@@ -81,6 +81,7 @@ html, body, [data-testid="stAppViewContainer"], button, input, textarea {{
 .quota.spent {{ color: #FF8A6B; border-color: #4A2318; background: #1F1210; }}
 .quota.owner {{ margin-left: .4rem; color: var(--ink); background: var(--yellow);
                 border-color: var(--yellow); font-weight: 700; }}
+.qsince {{ color: #8A7A3A; text-transform: none; letter-spacing: 0; }}
 
 h1.brand {{
     font-size: 1.85rem !important; font-weight: 700 !important;
@@ -460,11 +461,22 @@ cfg = {"configurable": {"thread_id": st.session_state.thread}}
 def quota_chip() -> str:
     try:
         used = be.quota_used_today()
+        since = be.quota_tracking_since()
     except Exception:
         return ""
     spent = used > be.DAILY_BUDGET
-    label = ("QUOTA SPENT — TRACK LISTS ONLY" if spent
-             else f"YOUTUBE QUOTA TODAY <b>{used:,}</b> / {be.DAILY_BUDGET:,}")
+    if spent:
+        label = "QUOTA SPENT — TRACK LISTS ONLY"
+    else:
+        # ">=" is not pedantry: the ledger is local, so a redeploy resets it
+        # mid-day and a bare number would under-report real spend.
+        prefix = "&ge;" if since else ""
+        label = (f"YOUTUBE QUOTA TODAY {prefix}<b>{used:,}</b> / "
+                 f"{be.DAILY_BUDGET:,}")
+        if since:
+            import datetime as _dt
+            t = _dt.datetime.fromtimestamp(since).strftime("%H:%M")
+            label += f' <span class="qsince">tracked since {t}</span>'
     return f'<span class="quota{" spent" if spent else ""}">{label}</span>'
 
 

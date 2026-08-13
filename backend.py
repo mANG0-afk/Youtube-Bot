@@ -230,7 +230,16 @@ def init_app_state():
         CREATE TABLE IF NOT EXISTS playlist_log (
             playlist_id TEXT, video_id TEXT, resolved_set_id TEXT,
             added_at REAL, PRIMARY KEY (playlist_id, video_id));
+
+        -- When this database began counting for a given Pacific day. Hosts with
+        -- an ephemeral filesystem reset the ledger on every redeploy, and
+        -- without this row the resulting 0 is indistinguishable from a genuine
+        -- 0 -- the app would report a clean budget on top of real spend.
+        CREATE TABLE IF NOT EXISTS quota_epoch (
+            day TEXT PRIMARY KEY, started_at REAL);
         """)
+        c.execute("INSERT OR IGNORE INTO quota_epoch VALUES (?,?)",
+                  (_pacific_day_key(), time.time()))
 
 
 def save_candidate_set(rows: list[dict], source: str) -> str:
@@ -292,12 +301,40 @@ def _search_query(artist_name: str, track_name: str) -> str:
 # computed in that zone. Getting this wrong shifts the reset by up to 8 hours
 # and the app looks broken for a whole evening.
 # --------------------------------------------------------------------------
-def _pacific_day_start() -> float:
-    from datetime import datetime, time as dtime
+def _pacific_now():
+    from datetime import datetime
     from zoneinfo import ZoneInfo
-    pt = ZoneInfo("America/Los_Angeles")
-    now = datetime.now(pt)
-    return datetime.combine(now.date(), dtime.min, tzinfo=pt).timestamp()
+    return datetime.now(ZoneInfo("America/Los_Angeles"))
+
+
+def _pacific_day_start() -> float:
+    from datetime import time as dtime
+    now = _pacific_now()
+    return now.replace(hour=0, minute=0, second=0,
+                       microsecond=0).timestamp()
+
+
+def _pacific_day_key() -> str:
+    return _pacific_now().strftime("%Y-%m-%d")
+
+
+def quota_tracking_since() -> Optional[float]:
+    """
+    When this database started counting today, or None if it has counted all day.
+
+    A redeploy wipes the SQLite ledger, so spend logged before it is invisible.
+    Returning the epoch lets the caller say ">= 2,700 since 14:20" instead of
+    presenting a reset counter as fact.
+    """
+    day_start = _pacific_day_start()
+    with _db() as c:
+        row = c.execute("SELECT started_at FROM quota_epoch WHERE day=?",
+                        (_pacific_day_key(),)).fetchone()
+    if not row:
+        return None
+    # 60s of slack: a container that boots seconds after midnight has, for all
+    # practical purposes, seen the whole day.
+    return None if row["started_at"] <= day_start + 60 else row["started_at"]
 
 
 def quota_used_today() -> int:
@@ -522,6 +559,96 @@ def mood_artists(mood: str, limit: int = 4) -> list[dict]:
         ORDER BY listeners DESC NULLS LAST, hits DESC
         LIMIT :lim
     """, {"mood": mood, "lim": limit})
+
+
+def resolve_seed_track(raw_track: str,
+                       raw_artist: str = "") -> Optional[dict]:
+    """
+    Find the named song in gold.track so its tags can seed a similarity search.
+
+    track_key is not unique -- covers and same-titled songs collide -- so without
+    an artist the most-played match wins. That is the one a person naming a song
+    bare almost always means.
+    """
+    tk = norm_key(raw_track)
+    if not tk:
+        return None
+
+    params = {"tk": tk}
+    where = "track_key = :tk"
+    if raw_artist.strip():
+        params["ak"] = norm_key(raw_artist)
+        where += " AND artist_key = :ak"
+
+    rows = query(f"""
+        SELECT artist_key, track_key, track_name, artist_name, tag_count
+        FROM {GOLD}.track
+        WHERE {where}
+        ORDER BY playcount DESC NULLS LAST
+        LIMIT 1
+    """, params)
+    if rows:
+        return rows[0] | {"how": "exact"}
+    # A bare LIKE would match "love" inside a hundred titles, so anchor it.
+    rows = query(f"""
+        SELECT artist_key, track_key, track_name, artist_name, tag_count
+        FROM {GOLD}.track
+        WHERE track_key LIKE :pat
+        ORDER BY playcount DESC NULLS LAST
+        LIMIT 1
+    """, {"pat": f"{tk}%"})
+    return (rows[0] | {"how": "prefix"}) if rows else None
+
+
+def similar_tracks_by_tags(artist_key: str, track_key: str,
+                           limit: int) -> list[dict]:
+    """
+    Rank other tracks by how many tags they share with the seed.
+
+    Explodes and joins rather than passing the tag list in as a parameter: the
+    databricks-sql-connector binds a Python list as an empty array<void>, so an
+    array_intersect against a bound list silently matches nothing. Resolving the
+    seed's tags inside SQL also keeps the whole thing one round-trip.
+
+    Ordering is shared-tag count first, playcount only as a tie-break --
+    otherwise every result collapses to the same few hits that happen to carry
+    one common tag.
+    """
+    return query(f"""
+        WITH seed AS (
+          SELECT DISTINCT lower(tag) AS tag
+          FROM {GOLD}.track LATERAL VIEW explode(tags) x AS tag
+          WHERE artist_key = :ak AND track_key = :tk
+        ),
+        cand AS (
+          SELECT artist_key, track_key, track_name, artist_name,
+                 duration_sec, playcount, lower(tag) AS tag
+          FROM {GOLD}.track LATERAL VIEW explode(tags) x AS tag
+        )
+        SELECT c.artist_key, c.track_key, c.track_name, c.artist_name,
+               c.duration_sec, COUNT(DISTINCT c.tag) AS shared_tags
+        FROM cand c
+        JOIN seed s ON c.tag = s.tag
+        WHERE NOT (c.artist_key = :ak AND c.track_key = :tk)
+        GROUP BY c.artist_key, c.track_key, c.track_name, c.artist_name,
+                 c.duration_sec, c.playcount
+        ORDER BY shared_tags DESC, c.playcount DESC NULLS LAST
+        LIMIT :lim
+    """, {"ak": artist_key, "tk": track_key, "lim": limit})
+
+
+def lastfm_track_artist(raw_track: str) -> Optional[str]:
+    """
+    Who performs this song, for songs absent from gold.track. autocorrect=1 so a
+    misspelled title still resolves, which is the whole point of asking Last.fm
+    rather than giving up.
+    """
+    data = _lastfm("track.search", track=raw_track, limit=1)
+    matches = (((data or {}).get("results", {})
+                .get("trackmatches", {}) or {}).get("track") or [])
+    if isinstance(matches, dict):
+        matches = [matches]
+    return matches[0].get("artist") if matches else None
 
 
 def resolve_artist(raw: str) -> tuple[Optional[dict], list[str]]:

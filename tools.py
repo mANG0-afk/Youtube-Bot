@@ -57,6 +57,13 @@ class MoodInput(BaseModel):
     limit: int = Field(10, description="How many tracks, 1-50")
 
 
+class SongInput(BaseModel):
+    track: str = Field(description="The song title the user named, as written")
+    artist: str = Field("", description="Performing artist, only if the user "
+                                        "named one alongside the song")
+    limit: int = Field(10, description="How many tracks, 1-50")
+
+
 class ResolveInput(BaseModel):
     candidate_set_id: str = Field(description="Handle from a find_tracks_* tool")
 
@@ -204,6 +211,53 @@ def find_tracks_by_mood(mood: str, limit: int = 10) -> dict:
     if not rows:
         return {"error": f"Nothing matched mood '{mood}'.", "available": MOODS}
     return _handle(rows[:limit], f"mood:{key}:{stage}")
+
+
+# --------------------------------------------------------------------------
+# PATH 4 -- SONG. Tag overlap against gold.track, with an artist fallback.
+#
+# Both stages live inside the tool. Exposing the fallback separately would let
+# the model decide when a song "counts as" found, which is a lookup result, not
+# a judgement.
+# --------------------------------------------------------------------------
+@tool(args_schema=SongInput)
+def find_tracks_like_song(track: str, artist: str = "",
+                          limit: int = 10) -> dict:
+    """
+    Find songs similar to one the user named. Use when the request names a SONG
+    rather than an artist, genre or mood -- "songs like Ms. Jackson", "something
+    similar to Chocolate", or a bare song title.
+    """
+    limit = _clamp(limit)
+    seed = be.resolve_seed_track(track, artist)
+
+    if seed:
+        rows = be.similar_tracks_by_tags(seed["artist_key"], seed["track_key"],
+                                         limit)
+        if rows:
+            out = _handle(rows, f"similar:{seed['track_name']}")
+            out["seed"] = f"{seed['track_name']} — {seed['artist_name']}"
+            out["matched_on"] = "shared tags"
+            return out
+
+    # Not in the catalogue, or catalogued with no usable tags. Ask Last.fm who
+    # performs it and fall back to that artist's own top tracks -- a related set
+    # by a known-correct artist beats an empty answer.
+    performer = artist.strip() or be.lastfm_track_artist(track)
+    if performer:
+        corrected, rows = be.lastfm_top_tracks(performer, limit)
+        if rows:
+            out = _handle(rows, f"artist:{corrected or performer}")
+            out["seed"] = f"{track} (not in catalogue)"
+            out["matched_on"] = f"top tracks by {corrected or performer}"
+            return out
+
+    return {
+        "error": f"Could not find '{track}' or identify who performs it.",
+        "instruction": "STOP. Tell the user the song could not be found and ask "
+                       "them to check the spelling or name the artist. Do NOT "
+                       "substitute another finder tool.",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +425,7 @@ READ_TOOLS = [
     find_tracks_by_genre,
     find_tracks_by_artist,
     find_tracks_by_mood,
+    find_tracks_like_song,
     resolve_to_youtube,
 ]
 
@@ -391,7 +446,12 @@ Moods supported: {', '.join(MOODS)}
 
 Check in this order and stop at the first match:
 
-1. Does the request name a specific person, band, singer, rapper, duo or group?
+1. Does the request point at a SONG -- "songs like X", "similar to X", "more
+   like X", or a bare song title?
+   -> find_tracks_like_song, passing the title as `track`. If the user named the
+   performer too ("songs like Chocolate by The 1975"), pass `artist` as well.
+
+2. Does the request name a specific person, band, singer, rapper, duo or group?
    -> find_tracks_by_artist, with that name exactly as written.
    This applies to EVERY named act, including ones you have never heard of and
    ones absent from the genre list. "Arijit Singh", "AC/DC", "Kanye West",
@@ -399,14 +459,35 @@ Check in this order and stop at the first match:
    the artist with romance, sadness, energy or any other feeling. A name is an
    artist, full stop.
 
-2. Otherwise, does it name one of the genres listed above?
+3. Otherwise, does it name one of the genres listed above?
    -> find_tracks_by_genre
 
-3. Otherwise, does it describe a feeling, situation or activity with no artist
+4. Otherwise, does it describe a feeling, situation or activity with no artist
    and no genre named ("something sad", "music for driving")?
    -> find_tracks_by_mood
 
 If none match, ask a clarifying question. Do not guess a tool.
+
+## Worked examples
+
+These are the distinctions that get confused. Match the shape, not the words.
+
+  "songs of Arijit Singh"          -> find_tracks_by_artist(artist="Arijit Singh")
+  "something sad for a long drive" -> find_tracks_by_mood(mood="sad")
+      A feeling, no name given. "sad" is the mood; "long drive" is not a second
+      request.
+  "songs like Ms. Jackson"         -> find_tracks_like_song(track="Ms. Jackson")
+      A song, not an artist. OutKast is never mentioned and you must not add it.
+  "play some Adele"                -> find_tracks_by_artist(artist="Adele")
+      A bare name is the ARTIST reading. Prefer artist over song when the string
+      could be either and there is no "like"/"similar to".
+  "more songs like Hello by Adele" -> find_tracks_like_song(track="Hello",
+                                                            artist="Adele")
+      "like" makes the song the subject; Adele only disambiguates which "Hello".
+  "top 10 hip-hop"                 -> find_tracks_by_genre(genre="hip-hop", limit=10)
+  "romantic songs by Arijit Singh" -> find_tracks_by_artist(artist="Arijit Singh")
+      A name plus a feeling is still the ARTIST. Never split one request across
+      two finders.
 
 ## Never substitute
 
@@ -428,7 +509,7 @@ _WRITE_MODE = """
 ## Sequence
 
 Always, in this order:
-1. a find_tracks_* tool          -> returns candidate_set_id
+1. a finder tool                 -> returns candidate_set_id
 2. resolve_to_youtube(candidate_set_id) -> returns resolved_set_id
 3. create_youtube_playlist(resolved_set_id) or add_to_youtube_playlist
 
